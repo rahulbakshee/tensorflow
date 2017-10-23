@@ -32,7 +32,7 @@ from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
 from tensorflow.python.framework import tensor_shape
-from tensorflow.python.framework import tensor_util
+from tensorflow.python.layers import utils
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import data_flow_ops
@@ -148,7 +148,7 @@ def input_producer(input_tensor,
   """
   with ops.name_scope(name, "input_producer", [input_tensor]):
     input_tensor = ops.convert_to_tensor(input_tensor, name="input_tensor")
-    element_shape = input_tensor.get_shape()[1:].merge_with(element_shape)
+    element_shape = input_tensor.shape[1:].merge_with(element_shape)
     if not element_shape.is_fully_defined():
       raise ValueError("Either `input_tensor` must have a fully defined shape "
                        "or `element_shape` must be specified")
@@ -168,7 +168,7 @@ def input_producer(input_tensor,
             q, [enq], cancel_op=cancel_op))
     if summary_name is not None:
       summary.scalar(summary_name,
-                     math_ops.cast(q.size(), dtypes.float32) * (1. / capacity))
+                     math_ops.to_float(q.size()) * (1. / capacity))
     return q
 
 
@@ -413,22 +413,6 @@ def _as_original_type(original_tensors, tensor_list):
     return tensor_list
 
 
-def _smart_cond(pred, if_true, if_false):
-  """A `tf.cond` that does nothing when the condition is static."""
-  pred = ops.convert_to_tensor(pred)
-  static_pred = tensor_util.constant_value(pred)
-  if static_pred is not None:
-    if static_pred:
-      return if_true()
-    else:
-      return if_false()
-  else:
-    return control_flow_ops.cond(
-        pred,
-        if_true,
-        if_false)
-
-
 def _store_sparse_tensors(tensor_list, enqueue_many, keep_input,
                           shared_map_ops=None):
   """Store SparseTensors for feeding into batch, etc.
@@ -465,7 +449,7 @@ def _store_sparse_tensors(tensor_list, enqueue_many, keep_input,
   def _sparse_meta_data(t, storing_op, map_op):
     if not isinstance(t, sparse_tensor.SparseTensor):
       return _SparseMetaData(False, None, None)
-    rank = t.dense_shape.get_shape().with_rank(1)[0]
+    rank = t.dense_shape.shape.with_rank(1)[0]
     if enqueue_many:
       rank -= 1
     # If a shared map_op was provided, use that. Otherwise use the name of
@@ -480,20 +464,27 @@ def _store_sparse_tensors(tensor_list, enqueue_many, keep_input,
     map_op_name = shared_map_op.name if shared_map_op else None
     def _maybe_store_sparse(t, map_op_name, keep_input):
       """Conditionally store a single sparse Tensor."""
-      return _smart_cond(
+      return utils.smart_cond(
           keep_input,
           lambda: _store_sparse(t, shared_name=map_op_name),
           lambda: constant_op.constant(-1, dtypes.int64))
     def _maybe_store_many_sparse(t, map_op_name, keep_input):
       """Conditionally store multiple sparse Tensors."""
-      out_tensor = _smart_cond(
+      out_tensor = utils.smart_cond(
           keep_input,
           lambda: _store_many_sparse(t, shared_name=map_op_name),
           lambda: -1 * array_ops.ones(array_ops.shape(t)[0:1], dtypes.int64))
       out_tensor.set_shape([None])  # necessary when t.ndims is unknown
       return out_tensor
-    if keep_input.get_shape().ndims == 1:
-      t = sparse_ops.sparse_retain(t, keep_input)
+    def _sparse_values_to_keep(t, keep_input):
+      """Convert a per-row `keep_input` vector to a per-value one."""
+      # Get the rows of every value in the sparse Tensor.
+      row_values = array_ops.reshape(
+          t.indices, [array_ops.shape(t.indices)[0], -1])[:, 0]
+      # The value should be kept iff the row should be kept.
+      return array_ops.gather(keep_input, row_values)
+    if keep_input.shape.ndims == 1:
+      t = sparse_ops.sparse_retain(t, _sparse_values_to_keep(t, keep_input))
       store_f = lambda t, name, _: _store_many_sparse(t, shared_name=name)
     elif enqueue_many:
       store_f = _maybe_store_many_sparse
@@ -577,13 +568,13 @@ def _validate_join(tensor_list_list):
 def _validate_keep_input(keep_input, enqueue_many):
   """Validate `keep_input` argument to conditional batching functions."""
   keep_input = ops.convert_to_tensor(keep_input)
-  if keep_input.get_shape().ndims is None:
+  if keep_input.shape.ndims is None:
     raise ValueError(
         "`keep_input` dimensions must be known at graph construction.")
-  if not enqueue_many and keep_input.get_shape().ndims == 1:
+  if not enqueue_many and keep_input.shape.ndims == 1:
     raise ValueError(
         "`keep_input` cannot be a vector when `enqueue_many=False`.")
-  if keep_input.get_shape().ndims > 1:
+  if keep_input.shape.ndims > 1:
     raise ValueError("`keep_input` must be 0 or 1 dimensions.")
   return keep_input
 
@@ -632,18 +623,18 @@ def _shapes(tensor_list_list, shapes, enqueue_many):
 
     for tl in tensor_list_list:
       for i in xrange(len0):
-        if tl[i].get_shape().ndims is None:
+        if tl[i].shape.ndims is None:
           raise ValueError("Cannot infer Tensor's rank: %s" % tl[i])
 
     shapes = [_merge_shapes(
-        [tl[i].get_shape().as_list() for tl in tensor_list_list], enqueue_many)
+        [tl[i].shape.as_list() for tl in tensor_list_list], enqueue_many)
               for i in xrange(len0)]
   return shapes
 
 
 def _select_which_to_enqueue(tensor_list, keep_input):
   """Select which examples to enqueue based on vector `keep_input`."""
-  select_i = math_ops.cast(keep_input, dtypes.int32)
+  select_i = math_ops.to_int32(keep_input)
   tensor_list = [
       data_flow_ops.dynamic_partition(x, select_i, num_partitions=2)[1]
       for x in tensor_list]
@@ -656,11 +647,11 @@ def _enqueue_join(queue, tensor_list_list, enqueue_many, keep_input):
     enqueue_fn = queue.enqueue_many
   else:
     enqueue_fn = queue.enqueue
-  if keep_input.get_shape().ndims == 1:
+  if keep_input.shape.ndims == 1:
     enqueue_ops = [enqueue_fn(_select_which_to_enqueue(x, keep_input))
                    for x in tensor_list_list]
   else:
-    enqueue_ops = [_smart_cond(
+    enqueue_ops = [utils.smart_cond(
         keep_input,
         lambda: enqueue_fn(tl),  # pylint:disable=cell-var-from-loop
         control_flow_ops.no_op) for tl in tensor_list_list]
@@ -673,11 +664,11 @@ def _enqueue(queue, tensor_list, threads, enqueue_many, keep_input):
     enqueue_fn = queue.enqueue_many
   else:
     enqueue_fn = queue.enqueue
-  if keep_input.get_shape().ndims == 1:
+  if keep_input.shape.ndims == 1:
     enqueue_ops = [
         enqueue_fn(_select_which_to_enqueue(tensor_list, keep_input))] * threads
   else:
-    enqueue_ops = [_smart_cond(
+    enqueue_ops = [utils.smart_cond(
         keep_input,
         lambda: enqueue_fn(tensor_list),
         control_flow_ops.no_op)] * threads
@@ -707,8 +698,7 @@ def _batch(tensors, batch_size, keep_input, num_threads=1, capacity=32,
         capacity=capacity, dtypes=types, shapes=shapes, shared_name=shared_name)
     _enqueue(queue, tensor_list, num_threads, enqueue_many, keep_input)
     summary.scalar("fraction_of_%d_full" % capacity,
-                   math_ops.cast(queue.size(), dtypes.float32) *
-                   (1. / capacity))
+                   math_ops.to_float(queue.size()) * (1. / capacity))
 
     if allow_smaller_final_batch:
       dequeued = queue.dequeue_up_to(batch_size, name=name)
@@ -742,8 +732,7 @@ def _batch_join(tensors_list, batch_size, keep_input, capacity=32,
         capacity=capacity, dtypes=types, shapes=shapes, shared_name=shared_name)
     _enqueue_join(queue, tensor_list_list, enqueue_many, keep_input)
     summary.scalar("fraction_of_%d_full" % capacity,
-                   math_ops.cast(queue.size(), dtypes.float32) *
-                   (1. / capacity))
+                   math_ops.to_float(queue.size()) * (1. / capacity))
 
     if allow_smaller_final_batch:
       dequeued = queue.dequeue_up_to(batch_size, name=name)
@@ -775,8 +764,8 @@ def _shuffle_batch(tensors, batch_size, capacity, min_after_dequeue,
         capacity=capacity, min_after_dequeue=min_after_dequeue, seed=seed,
         dtypes=types, shapes=shapes, shared_name=shared_name)
     _enqueue(queue, tensor_list, num_threads, enqueue_many, keep_input)
-    full = (math_ops.cast(math_ops.maximum(0, queue.size() - min_after_dequeue),
-                          dtypes.float32) *
+    full = (math_ops.to_float(
+        math_ops.maximum(0, queue.size() - min_after_dequeue)) *
             (1. / (capacity - min_after_dequeue)))
     # Note that name contains a '/' at the end so we intentionally do not place
     # a '/' after %s below.
@@ -812,8 +801,8 @@ def _shuffle_batch_join(tensors_list, batch_size, capacity,
         capacity=capacity, min_after_dequeue=min_after_dequeue, seed=seed,
         dtypes=types, shapes=shapes, shared_name=shared_name)
     _enqueue_join(queue, tensor_list_list, enqueue_many, keep_input)
-    full = (math_ops.cast(math_ops.maximum(0, queue.size() - min_after_dequeue),
-                          dtypes.float32) *
+    full = (math_ops.to_float(
+        math_ops.maximum(0, queue.size() - min_after_dequeue)) *
             (1. / (capacity - min_after_dequeue)))
     # Note that name contains a '/' at the end so we intentionally do not place
     # a '/' after %s below.
@@ -879,7 +868,7 @@ def batch(tensors, batch_size, num_threads=1, capacity=32,
   `batch_size` is returned when the queue is closed and there are not enough
   elements to fill the batch, otherwise the pending elements are discarded.
   In addition, all output tensors' static shapes, as accessed via the
-  `get_shape` method will have a first `Dimension` value of `None`, and
+  `shape` property will have a first `Dimension` value of `None`, and
   operations that depend on fixed batch_size would fail.
 
   Args:
@@ -1033,7 +1022,7 @@ def batch_join(tensors_list, batch_size, capacity=32, enqueue_many=False,
   `batch_size` is returned when the queue is closed and there are not enough
   elements to fill the batch, otherwise the pending elements are discarded.
   In addition, all output tensors' static shapes, as accessed via the
-  `get_shape` method will have a first `Dimension` value of `None`, and
+  `shape` property will have a first `Dimension` value of `None`, and
   operations that depend on fixed batch_size would fail.
 
   Args:
@@ -1088,8 +1077,8 @@ def maybe_batch_join(tensors_list, keep_input, batch_size, capacity=32,
       added to the queue or not.  If it is a scalar and evaluates `True`, then
       `tensors` are all added to the queue. If it is a vector and `enqueue_many`
       is `True`, then each example is added to the queue only if the
-      corresponding value in `keep_input` is `True`. This tensor essentially acts
-      as a filtering mechanism.
+      corresponding value in `keep_input` is `True`. This tensor essentially
+      acts as a filtering mechanism.
     batch_size: An integer. The new batch size pulled from the queue.
     capacity: An integer. The maximum number of elements in the queue.
     enqueue_many: Whether each tensor in `tensor_list_list` is a single
@@ -1178,7 +1167,7 @@ def shuffle_batch(tensors, batch_size, capacity, min_after_dequeue,
   `batch_size` is returned when the queue is closed and there are not enough
   elements to fill the batch, otherwise the pending elements are discarded.
   In addition, all output tensors' static shapes, as accessed via the
-  `get_shape` method will have a first `Dimension` value of `None`, and
+  `shape` property will have a first `Dimension` value of `None`, and
   operations that depend on fixed batch_size would fail.
 
   Args:
@@ -1239,8 +1228,8 @@ def maybe_shuffle_batch(tensors, batch_size, capacity, min_after_dequeue,
       added to the queue or not.  If it is a scalar and evaluates `True`, then
       `tensors` are all added to the queue. If it is a vector and `enqueue_many`
       is `True`, then each example is added to the queue only if the
-      corresponding value in `keep_input` is `True`. This tensor essentially acts
-      as a filtering mechanism.
+      corresponding value in `keep_input` is `True`. This tensor essentially
+      acts as a filtering mechanism.
     num_threads: The number of threads enqueuing `tensor_list`.
     seed: Seed for the random shuffling within the queue.
     enqueue_many: Whether each tensor in `tensor_list` is a single example.
@@ -1320,7 +1309,7 @@ def shuffle_batch_join(tensors_list, batch_size, capacity,
   `batch_size` is returned when the queue is closed and there are not enough
   elements to fill the batch, otherwise the pending elements are discarded.
   In addition, all output tensors' static shapes, as accessed via the
-  `get_shape` method will have a first `Dimension` value of `None`, and
+  `shape` property will have a first `Dimension` value of `None`, and
   operations that depend on fixed batch_size would fail.
 
   Args:
@@ -1381,8 +1370,8 @@ def maybe_shuffle_batch_join(tensors_list, batch_size, capacity,
       added to the queue or not.  If it is a scalar and evaluates `True`, then
       `tensors` are all added to the queue. If it is a vector and `enqueue_many`
       is `True`, then each example is added to the queue only if the
-      corresponding value in `keep_input` is `True`. This tensor essentially acts
-      as a filtering mechanism.
+      corresponding value in `keep_input` is `True`. This tensor essentially
+      acts as a filtering mechanism.
     seed: Seed for the random shuffling within the queue.
     enqueue_many: Whether each tensor in `tensor_list_list` is a single
       example.

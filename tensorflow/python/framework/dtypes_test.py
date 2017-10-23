@@ -27,9 +27,12 @@ from tensorflow.python.platform import googletest
 
 
 def _is_numeric_dtype_enum(datatype_enum):
-  return (datatype_enum != types_pb2.DT_INVALID and
-          datatype_enum != types_pb2.DT_RESOURCE and
-          datatype_enum != types_pb2.DT_RESOURCE_REF)
+  non_numeric_dtypes = [types_pb2.DT_VARIANT,
+                        types_pb2.DT_VARIANT_REF,
+                        types_pb2.DT_INVALID,
+                        types_pb2.DT_RESOURCE,
+                        types_pb2.DT_RESOURCE_REF]
+  return datatype_enum not in non_numeric_dtypes
 
 
 class TypesTest(test_util.TensorFlowTestCase):
@@ -265,6 +268,9 @@ class TypesTest(test_util.TensorFlowTestCase):
           self.assertEquals(dtype.min, 0)
           self.assertEquals(dtype.max, 4294967295)
       if numpy_dtype == np.uint32:
+        self.assertEquals(dtype.min, 0)
+        self.assertEquals(dtype.max, 4294967295)
+      if numpy_dtype == np.uint64:
         self.assertEquals(dtype.min, 0)
         self.assertEquals(dtype.max, 18446744073709551615)
       if numpy_dtype in (np.float16, np.float32, np.float64):

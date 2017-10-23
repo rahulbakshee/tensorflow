@@ -35,9 +35,9 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "external/llvm/include/llvm/IR/Function.h"
-#include "external/llvm/include/llvm/IR/IRBuilder.h"
-#include "external/llvm/include/llvm/IR/Value.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Value.h"
 #include "tensorflow/compiler/xla/service/buffer_assignment.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor_with_default.h"
 #include "tensorflow/compiler/xla/service/gpu/elemental_ir_emitter.h"
@@ -218,7 +218,6 @@ class IrEmitterUnnested : public IrEmitter {
  public:
   IrEmitterUnnested(const HloModuleConfig& hlo_module_config,
                     const HloComputation* hlo_computation,
-                    bool has_hybrid_result,
                     IrEmitterContext* ir_emitter_context);
   IrEmitterUnnested(const IrEmitterUnnested&) = delete;
   IrEmitterUnnested& operator=(const IrEmitterUnnested&) = delete;
@@ -340,8 +339,12 @@ class IrEmitterUnnested : public IrEmitter {
   // to make sure `inst` outlives the lifetime of the returned Thunk object.
   std::unique_ptr<Thunk> BuildGemmThunk(const HloInstruction* inst);
 
-  // Returns a CopyThunk that calls host-to-device cuMemcpy to implement `inst`.
-  std::unique_ptr<Thunk> BuildCopyThunk(const HloInstruction* inst);
+  // Returns a thunk that calls host-to-device cuMemcpy to implement `inst`.
+  std::unique_ptr<Thunk> BuildHostToDeviceCopyThunk(const HloInstruction* inst);
+
+  // Returns a thunk that calls device-to-device cuMemcpy to implement `inst`.
+  std::unique_ptr<Thunk> BuildDeviceToDeviceCopyThunk(
+      const HloInstruction* inst);
 
   // Returns an InfeedThunk that performs device-to-device memcpy to implement
   // `inst`.
@@ -366,10 +369,6 @@ class IrEmitterUnnested : public IrEmitter {
 
   // The HloComputation that this IrEmitter emits code for.
   const HloComputation* hlo_computation_;
-
-  // Whether this computation will produce a hybrid result, that is the
-  // computation produces a ShapedBuffer.
-  bool has_hybrid_result_;
 };
 
 // Emits LLVM IR for a nested computation to the resultant function.

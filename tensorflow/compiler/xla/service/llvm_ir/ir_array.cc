@@ -15,8 +15,8 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/llvm_ir/ir_array.h"
 
-#include "external/llvm/include/llvm/IR/Constants.h"
-#include "external/llvm/include/llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/llvm_util.h"
 #include "tensorflow/compiler/xla/shape_util.h"
@@ -268,8 +268,6 @@ llvm::Value* IrArray::EmitReadArrayElement(const Index& index,
   llvm::Value* element_address =
       EmitArrayElementAddress(index, ir_builder, name);
   llvm::LoadInst* load = ir_builder->CreateLoad(element_address);
-  llvm_ir::SetTbaaForInstruction(load, GetShape(),
-                                 /*is_pointer_to=*/false);
   AnnotateLoadStoreInstructionWithMetadata(load);
   return load;
 }
@@ -278,8 +276,6 @@ void IrArray::EmitWriteArrayElement(const Index& index, llvm::Value* value,
                                     llvm::IRBuilder<>* ir_builder) const {
   llvm::Value* element_address = EmitArrayElementAddress(index, ir_builder);
   llvm::StoreInst* store = ir_builder->CreateStore(value, element_address);
-  llvm_ir::SetTbaaForInstruction(store, GetShape(),
-                                 /*is_pointer_to=*/false);
   AnnotateLoadStoreInstructionWithMetadata(store);
 }
 
